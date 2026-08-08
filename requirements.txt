@@ -1,0 +1,7 @@
+psycopg2-binary>=2.9
+boto3>=1.34
+python-dotenv>=1.0
+numpy>=1.26
+rich>=13.7
+anthropic>=0.40          # optional: only needed if LLM_BACKEND=anthropic
+sentence-transformers>=2.7  # optional: real embeddings; falls back to a deterministic offline embedding if not installed
