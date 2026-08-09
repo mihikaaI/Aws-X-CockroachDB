@@ -12,7 +12,24 @@ from agents.base import Agent
 from agents.monitor_agent import MonitorAgent
 from tools import aws_client, crdb_client
 
-SAFE_DDL = re.compile(r"^\s*CREATE\s+INDEX\b", re.IGNORECASE)
+SAFE_DDL = re.compile(r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", re.IGNORECASE)
+
+
+def _is_safe_create_index(sql):
+    """Allow exactly one CREATE INDEX statement and nothing else.
+
+    The system prompt already constrains the model to CREATE INDEX, but that's
+    not a security boundary -- a poisoned memory row or an off-prompt model
+    could return `CREATE INDEX ...; DROP TABLE orders;`. Because execute_ddl
+    runs under autocommit (which executes multiple `;`-separated statements),
+    we must reject anything with a second statement here, not just check that
+    the string *starts* with CREATE INDEX."""
+    if not sql:
+        return False
+    stripped = sql.strip().rstrip(";").strip()
+    if ";" in stripped:  # a second statement is hiding after the first
+        return False
+    return bool(SAFE_DDL.match(stripped))
 
 CPU_SCALE_THRESHOLD = float(os.getenv("CPU_SCALE_THRESHOLD", "75.0"))
 ECS_CLUSTER = os.getenv("ECS_CLUSTER_NAME")
@@ -23,15 +40,21 @@ class ExecutionAgent(Agent):
     name = "execution"
 
     def apply_fix(self, proposed_fix_sql, incident_id=None):
-        if not proposed_fix_sql or not SAFE_DDL.match(proposed_fix_sql):
+        if not _is_safe_create_index(proposed_fix_sql):
             self.log(
                 incident_id,
                 "fix rejected",
-                f"not an allowed CREATE INDEX statement: {proposed_fix_sql!r}",
+                f"not an allowed single CREATE INDEX statement: {proposed_fix_sql!r}",
+                data={"proposed_fix_sql": proposed_fix_sql, "applied": False},
             )
             return False
         crdb_client.execute_ddl(proposed_fix_sql)
-        self.log(incident_id, "fix applied", proposed_fix_sql)
+        self.log(
+            incident_id,
+            "fix applied",
+            proposed_fix_sql,
+            data={"proposed_fix_sql": proposed_fix_sql, "applied": True},
+        )
         return True
 
     def benchmark(self, customer_id, since_date, incident_id=None):

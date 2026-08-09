@@ -3,11 +3,17 @@ Claude (via Bedrock or the Anthropic API -- see tools/llm.py) to diagnose a
 root cause and propose a fix. The model is constrained to only ever propose
 CREATE INDEX statements; execution_agent.py enforces that constraint again
 independently before running anything.
+
+The LLM is a synchronous dependency on the incident critical path, so it's
+wrapped with retries in tools/llm.py and a memory-based fallback here: if the
+model is unreachable, we degrade to the closest past incident from vector
+memory rather than failing the whole pipeline.
 """
 import json
+import re
 
 from agents.base import Agent
-from tools.llm import call_llm
+from tools.llm import LLMError, call_llm
 
 SYSTEM_PROMPT = """You are AgentOps, an autonomous database reliability engineer.
 You diagnose CockroachDB performance incidents from query latency, EXPLAIN
@@ -24,11 +30,16 @@ Only ever propose CREATE INDEX statements as fixes. Never propose DROP,
 ALTER TABLE, DELETE, or any other DML/DDL.
 """
 
+_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+
 
 class DiagnosticAgent(Agent):
     name = "diagnostic"
 
     def diagnose(self, monitor_result, similar_incidents, incident_id=None):
+        # Compact JSON in the prompt: no indentation whitespace, tight
+        # separators. Same information, materially fewer input tokens.
+        memory_json = json.dumps(similar_incidents, default=str, separators=(",", ":"))
         user_prompt = f"""Current incident:
 - latency: {monitor_result['latency_ms']:.1f} ms
 - full table scan detected: {monitor_result['full_scan']}
@@ -36,22 +47,56 @@ class DiagnosticAgent(Agent):
 {monitor_result['plan_text']}
 
 Similar past incidents from memory (may be empty):
-{json.dumps(similar_incidents, default=str, indent=2)}
+{memory_json}
 
 Diagnose the root cause and propose a fix."""
 
-        raw = call_llm(SYSTEM_PROMPT, user_prompt)
-        diagnosis = self._parse(raw)
+        try:
+            raw = call_llm(SYSTEM_PROMPT, user_prompt)
+            diagnosis = self._parse(raw)
+        except LLMError as e:
+            diagnosis = self._fallback_from_memory(similar_incidents, str(e))
 
         self.log(
             incident_id,
             "diagnosis",
             f"{diagnosis.get('root_cause')} (confidence={diagnosis.get('confidence')})",
+            data={
+                "root_cause": diagnosis.get("root_cause"),
+                "confidence": diagnosis.get("confidence"),
+                "proposed_fix_sql": diagnosis.get("proposed_fix_sql"),
+                "source": diagnosis.get("source", "llm"),
+            },
         )
         return diagnosis
 
     @staticmethod
-    def _parse(raw: str) -> dict:
+    def _fallback_from_memory(similar_incidents, error):
+        """LLM unreachable: degrade to the closest resolved past incident
+        instead of taking the whole pipeline down. The vector recall already
+        ran, so we reuse its top hit as a lower-confidence diagnosis."""
+        if similar_incidents:
+            best = similar_incidents[0]
+            return {
+                "root_cause": best.get("root_cause") or "recalled from memory",
+                "confidence": 0.5,
+                "proposed_fix_sql": best.get("resolution_sql"),
+                "reasoning": (
+                    "LLM unavailable; reused the most similar past incident from "
+                    f"vector memory. (LLM error: {error})"
+                ),
+                "source": "memory_fallback",
+            }
+        return {
+            "root_cause": "LLM unavailable and no similar incident in memory",
+            "confidence": 0.0,
+            "proposed_fix_sql": None,
+            "reasoning": f"LLM error: {error}",
+            "source": "unavailable",
+        }
+
+    @classmethod
+    def _parse(cls, raw: str) -> dict:
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.strip("`")
@@ -59,6 +104,13 @@ Diagnose the root cause and propose a fix."""
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
+            # Last resort: pull the first {...} block out of surrounding prose.
+            match = _JSON_OBJECT.search(cleaned)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    pass
             return {
                 "root_cause": "unparseable LLM response",
                 "confidence": 0.0,

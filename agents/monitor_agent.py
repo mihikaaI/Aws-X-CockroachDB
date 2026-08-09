@@ -30,5 +30,11 @@ class MonitorAgent(Agent):
             "latency check",
             f"{result['latency_ms']:.1f} ms (threshold {LATENCY_THRESHOLD_MS:.0f} ms), "
             f"full_scan={result['full_scan']}",
+            data={
+                "latency_ms": round(result["latency_ms"], 1),
+                "threshold_ms": LATENCY_THRESHOLD_MS,
+                "full_scan": result["full_scan"],
+                "breached": result["breached"],
+            },
         )
         return result

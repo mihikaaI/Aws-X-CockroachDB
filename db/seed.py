@@ -27,39 +27,35 @@ def apply_schema():
 def seed_customers():
     ids = [str(uuid.uuid4()) for _ in range(NUM_CUSTOMERS)]
     rows = [(cid, f"Customer {i}", random.choice(["APAC", "EU", "US"])) for i, cid in enumerate(ids)]
-    with crdb_client.get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO customers (id, name, region) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
-                rows,
-            )
-        conn.commit()
+    crdb_client.run_batch(
+        "INSERT INTO customers (id, name, region) VALUES %s ON CONFLICT DO NOTHING",
+        rows,
+    )
     return ids
 
 
 def seed_orders(customer_ids, batch_size=5000):
+    """Bulk-load orders with execute_values (batched multi-row INSERTs) instead
+    of per-row executemany, which was one network round-trip per row -- minutes
+    of wall time for 200k rows."""
     start_date = date.today() - timedelta(days=365)
-    with crdb_client.get_conn() as conn:
-        with conn.cursor() as cur:
+    batch = []
+    for _ in range(NUM_ORDERS):
+        cid = random.choice(customer_ids)
+        odate = start_date + timedelta(days=random.randint(0, 365))
+        amount = round(random.uniform(5, 500), 2)
+        batch.append((cid, odate, amount))
+        if len(batch) >= batch_size:
+            crdb_client.run_batch(
+                "INSERT INTO orders (customer_id, order_date, amount) VALUES %s",
+                batch,
+            )
             batch = []
-            for _ in range(NUM_ORDERS):
-                cid = random.choice(customer_ids)
-                odate = start_date + timedelta(days=random.randint(0, 365))
-                amount = round(random.uniform(5, 500), 2)
-                batch.append((cid, odate, amount))
-                if len(batch) >= batch_size:
-                    cur.executemany(
-                        "INSERT INTO orders (customer_id, order_date, amount) VALUES (%s, %s, %s)",
-                        batch,
-                    )
-                    conn.commit()
-                    batch = []
-            if batch:
-                cur.executemany(
-                    "INSERT INTO orders (customer_id, order_date, amount) VALUES (%s, %s, %s)",
-                    batch,
-                )
-                conn.commit()
+    if batch:
+        crdb_client.run_batch(
+            "INSERT INTO orders (customer_id, order_date, amount) VALUES %s",
+            batch,
+        )
 
 
 def seed_memory():
