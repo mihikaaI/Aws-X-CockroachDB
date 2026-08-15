@@ -70,6 +70,39 @@ Diagnose the root cause and propose a fix."""
         )
         return diagnosis
 
+    def diagnose_from_memory(self, top_incident, incident_id=None):
+        """Short-circuit: a near-identical resolved incident is already in
+        vector memory, so reuse its known fix and skip the LLM entirely. This
+        is the 'it gets smarter and cheaper every time' beat -- the second
+        occurrence of an incident costs zero model calls."""
+        distance = top_incident.get("distance")
+        diagnosis = {
+            "root_cause": top_incident.get("root_cause") or "recalled from memory",
+            "confidence": 0.95,
+            "proposed_fix_sql": top_incident.get("resolution_sql"),
+            "reasoning": (
+                "Recalled a near-identical resolved incident from vector memory "
+                "and reused its known fix without invoking the LLM."
+            ),
+            "source": "memory_shortcircuit",
+            "llm_skipped": True,
+        }
+        self.log(
+            incident_id,
+            "diagnosis (recalled)",
+            f"{diagnosis['root_cause']} — LLM skipped"
+            + (f" (distance={distance:.3f})" if distance is not None else ""),
+            data={
+                "root_cause": diagnosis["root_cause"],
+                "confidence": diagnosis["confidence"],
+                "proposed_fix_sql": diagnosis["proposed_fix_sql"],
+                "source": "memory_shortcircuit",
+                "llm_skipped": True,
+                "distance": distance,
+            },
+        )
+        return diagnosis
+
     @staticmethod
     def _fallback_from_memory(similar_incidents, error):
         """LLM unreachable: degrade to the closest resolved past incident

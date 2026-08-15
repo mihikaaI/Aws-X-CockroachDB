@@ -84,6 +84,36 @@ ECS scaling and CloudWatch metrics are stubbed to no-op gracefully if
 `ECS_CLUSTER_NAME` / `ECS_SERVICE_NAME` aren't set, so the DB-only demo
 above works even before you've stood up a real ECS service.
 
+## Guardrails & self-improving memory
+
+- **Self-improving:** when an incident's symptoms match a *resolved* past
+  incident in vector memory (distance ≤ `MEMORY_MATCH_MAX_DISTANCE`), AgentOps
+  reuses that known fix and **skips the LLM entirely** — the second occurrence
+  of an incident costs zero model calls. Symptoms are embedded as a canonical,
+  latency-independent signature so the same class of incident reliably clusters.
+- **Confidence-gated auto-apply:** fixes below `AUTO_APPLY_MIN_CONFIDENCE` are
+  proposed and held for a human instead of applied automatically.
+- **Dry-run:** set `DRY_RUN=1` to propose fixes without executing any DDL.
+- **Automatic rollback:** if an applied index doesn't improve latency by at
+  least `MIN_IMPROVEMENT_RATIO`, AgentOps drops it (a controlled `DROP INDEX`
+  built from the parsed index name — never from raw model text).
+- **One fix per incident** — no fix/re-fix loops.
+
+All guardrail thresholds live in `.env` (see `.env.example`).
+
+## Live dashboard
+
+`python dashboard.py` serves an explainability dashboard on
+`http://localhost:8888` that tails `agent_trace` and renders each agent step as
+it lands — optimistically drawing the expected pipeline steps as ghost cards,
+then reconciling them to confirmed cards as the DB rows arrive. Stdlib only.
+
+## Tests
+
+`pip install -r requirements-dev.txt && pytest` runs the unit suite (guardrails,
+write detection, LLM-response parsing, short-circuit logic) — no DB or network
+required. CI runs it on every push/PR (`.github/workflows/ci.yml`).
+
 ## Roadmap to Aug 18
 
 | Days | Focus |

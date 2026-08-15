@@ -15,14 +15,21 @@ class MemoryAgent(Agent):
         vec = embed(symptom_text)
         rows = crdb_client.run_query(
             """SELECT id, symptom_text, root_cause, resolution_sql,
-                      latency_before_ms, latency_after_ms
+                      latency_before_ms, latency_after_ms,
+                      symptom_embedding <-> %s::VECTOR AS distance
                FROM incidents
                WHERE resolved = true
                ORDER BY symptom_embedding <-> %s::VECTOR
                LIMIT %s""",
-            (str(vec), k),
+            (str(vec), str(vec), k),
         )
-        self.log(incident_id, "recall", f"found {len(rows)} similar past incident(s) in memory")
+        nearest = f", nearest distance {rows[0]['distance']:.3f}" if rows else ""
+        self.log(
+            incident_id,
+            "recall",
+            f"found {len(rows)} similar past incident(s) in memory{nearest}",
+            data={"matches": len(rows), "nearest_distance": (rows[0]["distance"] if rows else None)},
+        )
         return rows
 
     def store(
