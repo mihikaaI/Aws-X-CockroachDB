@@ -34,15 +34,18 @@ reporting = ReportingAgent()
 
 
 def symptom_signature(monitor_result):
-    """Canonical, latency-independent symptom string.
+    """Canonical, latency-independent symptom string, one per incident *class*.
 
-    Embedding this instead of the raw 'latency 934ms' text means the *same
-    class* of incident maps to the same vector every time, so vector memory
-    actually clusters (and, offline, matches exactly) -- which is what makes
-    the short-circuit reliable."""
+    Embedding this instead of the raw 'latency 934ms' text means the same class
+    of incident maps to the same vector every time, so vector memory actually
+    clusters (and, offline, matches exactly) -- which is what makes the
+    short-circuit reliable. The two classes map to the two fix families:
+      full scan      -> missing secondary index      (CREATE INDEX)
+      slow, no scan  -> stale table statistics        (ANALYZE)
+    """
     if monitor_result.get("full_scan"):
         return "hot query performing a full table scan; missing secondary index"
-    return "hot query with elevated latency; no full table scan detected"
+    return "hot query slow despite no full table scan; likely stale table statistics"
 
 
 def should_short_circuit(top_incident, threshold=MEMORY_MATCH_MAX_DISTANCE):
@@ -72,6 +75,9 @@ def run_once(customer_id, since_date=SINCE_DATE_DEFAULT):
         resolved=False,
     )
 
+    # Autonomous signal: let CockroachDB's own telemetry name the hot query.
+    monitor.discover_hot_query(incident_id=incident_id)
+
     similar = memory.search_similar(symptom_text, incident_id=incident_id)
     top = similar[0] if similar else None
 
@@ -97,8 +103,12 @@ def run_once(customer_id, since_date=SINCE_DATE_DEFAULT):
         after_ms = after["latency_ms"]
         improved = before_ms > 0 and after_ms <= before_ms * (1 - MIN_IMPROVEMENT_RATIO)
         if not improved:
-            execution.rollback_fix(diagnosis.get("proposed_fix_sql"), incident_id=incident_id)
-            fix_applied = False
+            rolled_back = execution.rollback_fix(
+                diagnosis.get("proposed_fix_sql"), incident_id=incident_id
+            )
+            # Only an index rollback undoes the fix; ANALYZE has nothing to undo.
+            if rolled_back:
+                fix_applied = False
 
     execution.maybe_scale(incident_id=incident_id)
 

@@ -13,6 +13,13 @@ def test_symptom_signature_distinguishes_full_scan():
     assert symptom_signature({"full_scan": True}) != symptom_signature({"full_scan": False})
 
 
+def test_symptom_signature_names_the_two_incident_classes():
+    idx = symptom_signature({"full_scan": True})
+    stats = symptom_signature({"full_scan": False})
+    assert "index" in idx.lower()
+    assert "statistic" in stats.lower()
+
+
 def test_short_circuit_on_near_identical_with_fix():
     top = {"distance": 0.0, "resolution_sql": "CREATE INDEX ..."}
     assert should_short_circuit(top, threshold=0.05) is True

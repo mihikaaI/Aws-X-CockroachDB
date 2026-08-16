@@ -23,11 +23,19 @@ this schema:
 {
   "root_cause": "short string",
   "confidence": 0.0-1.0,
-  "proposed_fix_sql": "a single CREATE INDEX statement, or null if no schema fix applies",
+  "proposed_fix_sql": "a single fix statement (see allowed fixes), or null if none applies",
   "reasoning": "2-3 sentence explanation a human engineer could read"
 }
-Only ever propose CREATE INDEX statements as fixes. Never propose DROP,
-ALTER TABLE, DELETE, or any other DML/DDL.
+
+Choose the fix that matches the incident:
+- Missing index (a full table scan in the plan): propose ONE
+  `CREATE INDEX ...` statement.
+- Stale table statistics (no full scan, but the optimizer picked a poor plan
+  from bad row-count estimates): propose ONE `ANALYZE <table>` statement to
+  refresh statistics.
+
+Propose exactly one statement, and ONLY from those two families. Never propose
+DROP, ALTER TABLE, DELETE, UPDATE, or any other DML/DDL.
 """
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)

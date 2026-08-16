@@ -14,7 +14,13 @@ from agents.base import Agent
 from agents.monitor_agent import MonitorAgent
 from tools import aws_client, crdb_client
 
+# Two fix families are allowed, matching the two incident classes:
+#   - CREATE INDEX / CREATE UNIQUE INDEX  -> missing-index incidents
+#   - ANALYZE <table> / CREATE STATISTICS -> stale-statistics incidents
+# Everything else (DROP, ALTER, DELETE, ...) is rejected.
 SAFE_DDL = re.compile(r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", re.IGNORECASE)
+SAFE_ANALYZE = re.compile(r"^\s*ANALYZE\s+[A-Za-z_][\w.]*\s*$", re.IGNORECASE)
+SAFE_CREATE_STATS = re.compile(r"^\s*CREATE\s+STATISTICS\b", re.IGNORECASE)
 
 # Pull the index name + target table out of a validated CREATE INDEX so we can
 # build a *controlled* DROP INDEX for rollback (never from raw LLM text).
@@ -50,6 +56,31 @@ def _is_safe_create_index(sql):
     return bool(SAFE_DDL.match(stripped))
 
 
+def _fix_kind(sql):
+    """Classify a proposed fix as 'index', 'analyze', 'stats', or None.
+
+    Same single-statement / no-injection hardening as the index guard: reject
+    anything with a hidden second statement, then match against the allowed
+    families."""
+    if not sql:
+        return None
+    stripped = sql.strip().rstrip(";").strip()
+    if ";" in stripped:  # a second statement is hiding after the first
+        return None
+    if SAFE_DDL.match(stripped):
+        return "index"
+    if SAFE_ANALYZE.match(stripped):
+        return "analyze"
+    if SAFE_CREATE_STATS.match(stripped):
+        return "stats"
+    return None
+
+
+def _is_safe_fix(sql):
+    """Allow exactly one statement from an approved fix family."""
+    return _fix_kind(sql) is not None
+
+
 def _index_target(sql):
     """Return (index_name, table) from a CREATE INDEX statement, or None."""
     if not sql:
@@ -64,13 +95,15 @@ class ExecutionAgent(Agent):
     name = "execution"
 
     def apply_fix(self, proposed_fix_sql, incident_id=None, confidence=None, dry_run=None):
-        """Apply the proposed index, subject to guardrails. Returns a status
-        string: 'applied' | 'dry_run' | 'held' | 'rejected'."""
-        if not _is_safe_create_index(proposed_fix_sql):
+        """Apply the proposed fix (CREATE INDEX or ANALYZE/CREATE STATISTICS),
+        subject to guardrails. Returns a status string:
+        'applied' | 'dry_run' | 'held' | 'rejected'."""
+        kind = _fix_kind(proposed_fix_sql)
+        if kind is None:
             self.log(
                 incident_id,
                 "fix rejected",
-                f"not an allowed single CREATE INDEX statement: {proposed_fix_sql!r}",
+                f"not an allowed single CREATE INDEX / ANALYZE statement: {proposed_fix_sql!r}",
                 data={"proposed_fix_sql": proposed_fix_sql, "status": "rejected"},
             )
             return "rejected"
@@ -82,7 +115,8 @@ class ExecutionAgent(Agent):
                 "fix held for approval",
                 f"confidence {confidence:.2f} < {AUTO_APPLY_MIN_CONFIDENCE:.2f}; "
                 f"proposing without applying: {proposed_fix_sql}",
-                data={"proposed_fix_sql": proposed_fix_sql, "status": "held", "confidence": confidence},
+                data={"proposed_fix_sql": proposed_fix_sql, "status": "held",
+                      "confidence": confidence, "kind": kind},
             )
             return "held"
 
@@ -91,8 +125,8 @@ class ExecutionAgent(Agent):
             self.log(
                 incident_id,
                 "fix dry-run",
-                f"DRY_RUN set; would apply: {proposed_fix_sql}",
-                data={"proposed_fix_sql": proposed_fix_sql, "status": "dry_run"},
+                f"DRY_RUN set; would apply ({kind}): {proposed_fix_sql}",
+                data={"proposed_fix_sql": proposed_fix_sql, "status": "dry_run", "kind": kind},
             )
             return "dry_run"
 
@@ -100,17 +134,25 @@ class ExecutionAgent(Agent):
         self.log(
             incident_id,
             "fix applied",
-            proposed_fix_sql,
-            data={"proposed_fix_sql": proposed_fix_sql, "status": "applied"},
+            f"({kind}) {proposed_fix_sql}",
+            data={"proposed_fix_sql": proposed_fix_sql, "status": "applied", "kind": kind},
         )
         return "applied"
 
     def rollback_fix(self, proposed_fix_sql, incident_id=None):
-        """Drop the index we created (controlled DROP built from the parsed
-        name/table, never from raw model text) when the fix didn't help."""
+        """Undo a fix that didn't help. Only CREATE INDEX is reversible (via a
+        controlled DROP INDEX built from the parsed name/table, never from raw
+        model text). ANALYZE / CREATE STATISTICS is idempotent maintenance with
+        nothing to undo, so we skip it. Returns True only if we actually rolled
+        something back."""
         target = _index_target(proposed_fix_sql)
         if not target:
-            self.log(incident_id, "rollback skipped", f"could not parse index from {proposed_fix_sql!r}")
+            self.log(
+                incident_id,
+                "rollback skipped",
+                f"nothing to roll back for non-index fix: {proposed_fix_sql!r}",
+                data={"proposed_fix_sql": proposed_fix_sql, "status": "rollback_skipped"},
+            )
             return False
         name, table = target
         drop_sql = f"DROP INDEX IF EXISTS {table}@{name}"

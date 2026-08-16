@@ -84,6 +84,31 @@ ECS scaling and CloudWatch metrics are stubbed to no-op gracefully if
 `ECS_CLUSTER_NAME` / `ECS_SERVICE_NAME` aren't set, so the DB-only demo
 above works even before you've stood up a real ECS service.
 
+## Two incident types (not one hardcoded scenario)
+
+AgentOps diagnoses and fixes two distinct classes of incident, picking the fix
+family from the evidence rather than assuming one:
+
+| Incident | Signal | Fix family |
+|---|---|---|
+| Missing index | full table scan in `EXPLAIN ANALYZE` | `CREATE INDEX` |
+| Stale statistics | slow query with **no** full scan (bad optimizer estimates) | `ANALYZE <table>` |
+
+- `python demo_scenario.py` — the missing-index scenario.
+- `python demo_stale_stats.py` — the stale-statistics scenario (fix = `ANALYZE`).
+
+The execution guard independently allows *only* these two single-statement fix
+families and rejects everything else; index fixes are rolled back if they don't
+help, while `ANALYZE` is idempotent maintenance with nothing to undo.
+
+## Autonomous hot-query discovery
+
+Instead of only trusting the built-in hot query, the monitor reads
+CockroachDB's own per-statement telemetry
+(`crdb_internal.node_statement_statistics`) to identify the worst-performing
+statement touching the target table, and logs it into the trace. Best-effort:
+if stats aren't available yet it falls back to the built-in query.
+
 ## Guardrails & self-improving memory
 
 - **Self-improving:** when an incident's symptoms match a *resolved* past
