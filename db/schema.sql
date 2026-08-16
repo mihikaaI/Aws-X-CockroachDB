@@ -54,5 +54,15 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     agent_name STRING NOT NULL,
     step STRING NOT NULL,
     detail STRING,
+    data JSONB,               -- structured payload for the live dashboard
     created_at TIMESTAMPTZ DEFAULT now()
 );
+
+-- If the table pre-dates the `data` column (older demo runs), add it in place.
+ALTER TABLE agent_trace ADD COLUMN IF NOT EXISTS data JSONB;
+
+-- Replaying/streaming a trace filters by incident_id and orders by time.
+-- Without this index that read is a full scan -- exactly the anti-pattern
+-- this whole project exists to detect, so we don't ship it on our own table.
+CREATE INDEX IF NOT EXISTS idx_agent_trace_incident
+    ON agent_trace (incident_id, created_at);

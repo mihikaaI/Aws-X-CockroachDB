@@ -20,7 +20,17 @@ class ReportingAgent(Agent):
             f"Fix applied: {diagnosis.get('proposed_fix_sql') if fix_applied else 'none -- see reasoning below'}\n"
             f"Reasoning: {diagnosis.get('reasoning', '')}"
         )
-        self.log(incident_id, "report", report.replace("\n", " | "))
+        self.log(
+            incident_id,
+            "report",
+            report.replace("\n", " | "),
+            data={
+                "latency_before_ms": round(before["latency_ms"], 1),
+                "latency_after_ms": round(after["latency_ms"], 1),
+                "improvement_pct": round(improvement_pct, 1),
+                "fix_applied": fix_applied,
+            },
+        )
 
         MemoryAgent().update_resolution(
             incident_id,

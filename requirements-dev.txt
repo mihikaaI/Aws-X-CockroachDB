@@ -1,0 +1,8 @@
+# Dev/test dependencies. Runtime deps are in requirements.txt; the heavy,
+# backend-specific ones (sentence-transformers, anthropic) are imported lazily
+# so the test suite doesn't need them.
+pytest>=8.0
+rich>=13.7
+numpy>=1.26
+psycopg2-binary>=2.9
+boto3>=1.34
