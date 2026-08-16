@@ -9,24 +9,32 @@ changes, then AWS scaling if needed), and explains what it did in plain English.
 ```
                     ┌─────────────────┐
    traffic spike →  │  MonitorAgent   │  polls hot query latency + EXPLAIN ANALYZE
+                    │                 │  (+ discovers the hot query itself via
+                    │                 │  crdb_internal.node_statement_statistics)
                     └────────┬────────┘
                              │ latency > threshold
                              ▼
                     ┌─────────────────┐
-                    │  MemoryAgent    │  embeds symptoms → vector search over
-                    │  (CRDB VECTOR)  │  past incidents (CockroachDB C-SPANN index)
-                    └────────┬────────┘
-                             │ similar incidents
+                    │  MemoryAgent    │  embeds a canonical symptom signature →
+                    │  (CRDB VECTOR)  │  vector search over past incidents
+                    └────────┬────────┘  (CockroachDB C-SPANN index)
+                             │ similar incidents (+ distance)
                              ▼
+                 near-identical match? ──yes──► reuse known fix, SKIP THE LLM
+                             │ no                    (self-improving: incident
+                             ▼                         #2 costs zero model calls)
                     ┌─────────────────┐
                     │ DiagnosticAgent │  Claude (Bedrock or Anthropic API) reasons
                     │                 │  over metrics + plan + memory → root cause
-                    └────────┬────────┘  + proposed CREATE INDEX
+                    └────────┬────────┘  + one fix: CREATE INDEX or ANALYZE
                              │
                              ▼
                     ┌─────────────────┐
-                    │ ExecutionAgent  │  applies index → re-benchmarks →
-                    │                 │  if CPU still high: scales ECS
+                    │ ExecutionAgent  │  guardrails: confidence-gated auto-apply,
+                    │                 │  DRY_RUN, one fix/incident → applies fix
+                    │                 │  → re-benchmarks → rolls back index fixes
+                    │                 │  that didn't help → if CPU still high:
+                    │                 │  scales ECS
                     └────────┬────────┘
                              │
                              ▼
@@ -35,14 +43,18 @@ changes, then AWS scaling if needed), and explains what it did in plain English.
                     │                 │  back to vector memory for next time
                     └─────────────────┘
 
-  Every step from every agent is written to agent_trace (explainability).
+  Every step from every agent is written to agent_trace (explainability),
+  streamed live by dashboard.py.
 ```
 
 **Why CockroachDB, specifically:** the incident memory lives in the *same*
 distributed SQL database as the operational data, using CockroachDB's native
 `VECTOR` type + `CREATE VECTOR INDEX` (C-SPANN) — no separate vector DB, no
 sync pipeline. That's a genuine, judge-visible use of a CockroachDB-specific
-capability, not just "Postgres with pgvector bolted on."
+capability, not just "Postgres with pgvector bolted on." The monitor also
+reads CockroachDB's own telemetry (`crdb_internal`) to find the hot query
+autonomously, and the memory short-circuit means recall isn't just flavor —
+it measurably skips the LLM on repeat incidents.
 
 **Why AWS:** ECS is the scaled resource (CloudWatch → `UpdateService`), and
 the reasoning agent can run on Bedrock, which doubles as a second AWS
@@ -52,16 +64,25 @@ integration point beyond raw compute.
 
 ```
 agentops/
-├── db/schema.sql        # orders (no index, on purpose) + incidents (vector memory) + agent_trace
-├── db/seed.py            # seeds demo data + one pre-loaded memory
-├── tools/crdb_client.py  # CockroachDB access (timed queries, EXPLAIN ANALYZE, DDL)
-├── tools/aws_client.py   # CloudWatch metrics + ECS scaling
-├── tools/embeddings.py   # text -> 384-dim vector (sentence-transformers, offline fallback)
-├── tools/llm.py          # Bedrock or Anthropic API, same interface either way
-├── agents/               # one file per agent, all inherit agents/base.py for tracing
-├── orchestrator.py       # wires the agents into the incident pipeline
-├── load_generator.py     # simulates a traffic spike for a repeatable demo
-└── demo_scenario.py      # single command: seed -> incident -> fix -> report
+├── db/schema.sql          # orders (no index, on purpose) + incidents (vector memory) + agent_trace
+├── db/seed.py              # seeds demo data + one pre-loaded memory (bulk INSERT via execute_values)
+├── tools/crdb_client.py    # pooled CockroachDB access (timed queries, EXPLAIN ANALYZE, DDL)
+├── tools/aws_client.py     # CloudWatch metrics + ECS scaling
+├── tools/embeddings.py     # text -> 384-dim vector (sentence-transformers, offline fallback)
+├── tools/llm.py            # Bedrock or Anthropic API, same interface either way, retry/timeout
+├── agents/                 # one file per agent, all inherit agents/base.py for tracing
+│   ├── monitor_agent.py    #   latency check + crdb_internal hot-query discovery
+│   ├── memory_agent.py     #   vector store/recall, returns match distance
+│   ├── diagnostic_agent.py #   LLM diagnosis (CREATE INDEX or ANALYZE) + memory fallback
+│   ├── execution_agent.py  #   guardrails: confidence gate, dry-run, apply, rollback, ECS scale
+│   └── reporting_agent.py  #   NL report + writes resolution back to memory
+├── orchestrator.py         # wires the agents into the incident pipeline, short-circuit + guardrails
+├── load_generator.py       # simulates a traffic spike for a repeatable demo
+├── demo_scenario.py        # single command: seed -> missing-index incident -> fix -> report
+├── demo_stale_stats.py     # single command: seed -> stale-statistics incident -> ANALYZE -> report
+├── dashboard.py            # live agent_trace viewer with optimistic rendering (stdlib, port 8888)
+├── tests/                  # pytest suite over pure logic, no DB/network required
+└── .github/workflows/ci.yml
 ```
 
 ## Setup
@@ -72,11 +93,20 @@ agentops/
 2. `cp .env.example .env` and fill in `DATABASE_URL` and your LLM backend
    (Bedrock is the default; flip to `LLM_BACKEND=anthropic` if you'd rather
    use an Anthropic API key directly — faster to set up under time pressure).
+   `.env.example` documents every guardrail threshold (`DRY_RUN`,
+   `AUTO_APPLY_MIN_CONFIDENCE`, `MIN_IMPROVEMENT_RATIO`,
+   `MEMORY_MATCH_MAX_DISTANCE`, connection pool sizing, etc).
 3. `pip install -r requirements.txt`
 4. `python demo_scenario.py` — seeds ~200k unindexed orders, detects the
    slow query, diagnoses it, creates the index, re-benchmarks, and prints
-   the report. That's your whole demo in one command.
-5. Optional, for the "watch it happen live" version:
+   the report. That's your whole demo in one command. Run it twice to see
+   the self-improving short-circuit: the second run recalls the resolved
+   incident from memory and skips the LLM entirely.
+5. `python demo_stale_stats.py` — the second incident type (fix = `ANALYZE`),
+   to show the pipeline generalizes past one hardcoded scenario.
+6. `python dashboard.py` (optional, run alongside either demo) — live view of
+   `agent_trace` at `http://localhost:8888`.
+7. Optional, for the "watch it happen live" version:
    `python load_generator.py --customer-id <id> &` then
    `python orchestrator.py --customer-id <id> --loop`.
 
@@ -141,25 +171,64 @@ required. CI runs it on every push/PR (`.github/workflows/ci.yml`).
 
 ## Roadmap to Aug 18
 
-| Days | Focus |
-|---|---|
-| **Aug 8–9** | CockroachDB Cloud cluster + AWS account/ECS sample service. Run this scaffold end-to-end locally with `demo_scenario.py`. |
-| **Aug 10** | Real EXPLAIN ANALYZE parsing edge cases (joins, multiple missing indexes); tighten the diagnostic prompt with a couple more few-shot examples. |
-| **Aug 11** | Wire `tools/aws_client.py` to your real ECS cluster/service; confirm CloudWatch CPU pulls correctly; test `maybe_scale`. |
-| **Aug 12** | Deploy a small sample app to ECS in front of the CockroachDB cluster (this is what "traffic increases" is monitoring) — a trivial FastAPI/Express app hitting the `orders` table is enough. |
-| **Aug 13** | Guardrails: dry-run mode, rollback path if a fix doesn't help, max-one-fix-per-incident to avoid loops. |
-| **Aug 14** | Polish `load_generator.py` timing so the live demo reliably reproduces the spike; add a second incident type (e.g., stale table stats) to show generality, not just one hardcoded scenario. |
-| **Aug 15** | Optional: minimal live-status HTML page reading `agent_trace` in real time — strong demo value for "explainability" if you have time. |
-| **Aug 16** | Full dry runs of the demo, 3–4 times, timing it. Fix whatever breaks. |
-| **Aug 17** | Record a backup demo video (live demos fail; judges appreciate a fallback). Write the submission write-up: architecture, what's CockroachDB-specific, what's AWS-specific. |
-| **Aug 18** | Buffer day + submission. |
+| Days | Focus | Status |
+|---|---|---|
+| **Aug 8–9** | CockroachDB Cloud cluster + AWS account/ECS sample service. Run this scaffold end-to-end locally with `demo_scenario.py`. | |
+| **Aug 10** | Real EXPLAIN ANALYZE parsing edge cases (joins, multiple missing indexes); tighten the diagnostic prompt with a couple more few-shot examples. | |
+| **Aug 11** | Wire `tools/aws_client.py` to your real ECS cluster/service; confirm CloudWatch CPU pulls correctly; test `maybe_scale`. | ⬜ next up |
+| **Aug 12** | Deploy a small sample app to ECS in front of the CockroachDB cluster (this is what "traffic increases" is monitoring) — a trivial FastAPI/Express app hitting the `orders` table is enough. | ⬜ next up |
+| **Aug 13** | Guardrails: dry-run mode, rollback path if a fix doesn't help, max-one-fix-per-incident to avoid loops. | ✅ done — confidence gate, `DRY_RUN`, index rollback, one-fix/incident |
+| **Aug 14** | Polish `load_generator.py` timing; add a second incident type (e.g., stale table stats) to show generality, not just one hardcoded scenario. | ✅ done — `demo_stale_stats.py` + `ANALYZE` fix family; connection pool fixes the load-generator connection storm |
+| **Aug 15** | Optional: minimal live-status HTML page reading `agent_trace` in real time — strong demo value for "explainability" if you have time. | ✅ done — `dashboard.py`, optimistic rendering |
+| **Aug 16** | Full dry runs of the demo, 3–4 times, timing it. Fix whatever breaks. | ⬜ do this once AWS is wired |
+| **Aug 17** | Record a backup demo video (live demos fail; judges appreciate a fallback). Write the submission write-up: architecture, what's CockroachDB-specific, what's AWS-specific. | |
+| **Aug 18** | Buffer day + submission. | |
+
+Also done, beyond the original roadmap: pooled DB connections (no more
+connection-storm risk from `load_generator.py`), bulk seeding via
+`execute_values`, LLM timeout/retry with a memory-based fallback, a hardened
+single-statement DDL guard, `crdb_internal`-driven hot-query discovery, the
+self-improving memory short-circuit, `.env.example`, and a 48-test CI suite
+(`.github/workflows/ci.yml`).
+
+**What's left before the AWS side:** wiring `tools/aws_client.py` to a real
+ECS cluster/service and standing up the sample app CloudWatch is watching —
+everything else in this list is DB/LLM-only and already demo-ready.
+
+## USP — what makes this different
+
+**An autonomous database reliability engineer whose long-term memory lives
+inside the same distributed SQL database it's protecting — so every incident
+it resolves makes the next one faster, cheaper, and auditable, with no
+separate vector store and no sync pipeline.**
+
+- **Self-improving, not just self-healing.** The resolution gets written back
+  into vector memory, so the *second* occurrence of a known incident is
+  recalled and fixed **without an LLM call**. Run `demo_scenario.py` twice —
+  the second run's trace shows `diagnosis (recalled) — LLM skipped`. That's a
+  measurable, on-stage "it gets smarter" moment most agent demos can't show.
+- **Memory colocated with operational data.** Incident memory is a native
+  `VECTOR` column + C-SPANN index in the *same* cluster as `orders` — no
+  Pinecone, no ETL, no consistency drift between the data and the memory of
+  the data.
+- **Explainability as a first-class artifact.** Every autonomous action —
+  including ones it *declined* to take (held for approval, rolled back) — is
+  in `agent_trace`, replayable via `dashboard.py` and summarized in the NL
+  report. That's the answer to "I can't let an AI run DDL I can't audit."
+- **Generalizes past one hardcoded scenario.** Two independently-diagnosed
+  incident classes (missing index, stale statistics), each with its own fix
+  family and guard.
 
 ## What to emphasize for judging
 
 - **CockroachDB-specific**: vector memory colocated with operational data,
-  `EXPLAIN ANALYZE`-driven diagnosis, distributed SQL resilience story if
-  you get time to demo a node failure mid-incident.
+  `EXPLAIN ANALYZE`-driven diagnosis, `crdb_internal`-driven hot-query
+  discovery, distributed SQL resilience story if you get time to demo a node
+  failure mid-incident.
 - **AWS-specific**: Bedrock for reasoning, CloudWatch → ECS scaling loop.
-- **Explainability**: the `agent_trace` table + the final NL report are your
-  answer to "why did the agent do that" — surface both in the demo, not
-  just the end result.
+- **Explainability**: the `agent_trace` table + live dashboard + the final NL
+  report are your answer to "why did the agent do that" — surface all three
+  in the demo, not just the end result.
+- **Self-improving memory**: run the same demo twice and point at the
+  `LLM skipped` trace line — this is the single strongest differentiator
+  versus observe-only APM tools and bolt-on vector databases.
