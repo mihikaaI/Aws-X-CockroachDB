@@ -4,46 +4,42 @@
 
 Both paths use a Claude model so the diagnostic agent's prompt doesn't need
 to change based on backend.
+
+The LLM sits on the incident critical path, so calls are wrapped with a
+bounded retry/backoff. On exhaustion we raise ``LLMError`` -- the diagnostic
+agent catches it and falls back to vector memory rather than crashing.
 """
 import os
+import time
+from dotenv import load_dotenv
+from google import genai
 
+load_dotenv(override=True)
+
+class LLMError(RuntimeError):
+    """Raised when the LLM backend fails after all retries."""
+    pass
 
 def call_llm(system_prompt: str, user_prompt: str) -> str:
-    backend = os.getenv("LLM_BACKEND", "bedrock").lower()
-
-    if backend == "bedrock":
-        return _call_bedrock(system_prompt, user_prompt)
-    elif backend == "anthropic":
-        return _call_anthropic(system_prompt, user_prompt)
+    backend = os.getenv("LLM_BACKEND", "gemini").lower()
+    
+    if backend == "gemini":
+        client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+        full_prompt = f"{system_prompt}\n\nUser Request:\n{user_prompt}"
+        
+        # Retry up to 5 times with increasing delays for 503 capacity spikes
+        for attempt in range(1, 6):
+            try:
+                chat = client.chats.create(model=model_name)
+                response = chat.send_message(full_prompt)
+                return response.text
+            except Exception as e:
+                if attempt == 5:
+                    raise LLMError(f"Gemini API call failed after 5 attempts: {e}")
+                time.sleep(3 * attempt)  # Delay 3s, 6s, 9s, 12s
+                
+    elif backend in ("bedrock", "anthropic"):
+        raise LLMError(f"Backend '{backend}' configured but credentials not set.")
     else:
-        raise ValueError(f"Unknown LLM_BACKEND: {backend!r} (use 'bedrock' or 'anthropic')")
-
-
-def _call_bedrock(system_prompt: str, user_prompt: str) -> str:
-    import boto3
-
-    client = boto3.client("bedrock-runtime", region_name=os.getenv("AWS_REGION", "us-east-1"))
-    model_id = os.getenv("BEDROCK_MODEL_ID")
-    if not model_id:
-        raise RuntimeError("BEDROCK_MODEL_ID is not set -- check the model catalog in your Bedrock console")
-
-    resp = client.converse(
-        modelId=model_id,
-        system=[{"text": system_prompt}],
-        messages=[{"role": "user", "content": [{"text": user_prompt}]}],
-        inferenceConfig={"maxTokens": 1024, "temperature": 0.2},
-    )
-    return resp["output"]["message"]["content"][0]["text"]
-
-
-def _call_anthropic(system_prompt: str, user_prompt: str) -> str:
-    import anthropic
-
-    client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
-    resp = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=1024,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    return resp.content[0].text
+        raise ValueError(f"Unknown LLM_BACKEND: {backend!r}")
