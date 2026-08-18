@@ -1,0 +1,18 @@
+[Unit]
+Description=AgentOps orchestrator (continuous monitoring loop)
+After=network.target agentops-dashboard.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Aws-X-CockroachDB-updt
+EnvironmentFile=/home/ubuntu/Aws-X-CockroachDB-updt/.env
+# Fill in a real customer UUID (see README "Setup" step 4/7), or leave this
+# unit disabled and just run demo_scenario.py / demo_stale_stats.py manually
+# for a controlled, repeatable judging demo instead.
+ExecStart=/home/ubuntu/Aws-X-CockroachDB-updt/venv/bin/python orchestrator.py --customer-id CHANGE_ME --loop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

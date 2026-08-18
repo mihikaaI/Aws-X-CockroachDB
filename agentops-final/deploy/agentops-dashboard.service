@@ -1,0 +1,15 @@
+[Unit]
+Description=AgentOps live dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Aws-X-CockroachDB-updt
+EnvironmentFile=/home/ubuntu/Aws-X-CockroachDB-updt/.env
+ExecStart=/home/ubuntu/Aws-X-CockroachDB-updt/venv/bin/python dashboard.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

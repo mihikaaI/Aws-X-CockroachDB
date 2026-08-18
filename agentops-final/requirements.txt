@@ -1,0 +1,11 @@
+psycopg2-binary>=2.9
+boto3>=1.34
+python-dotenv>=1.0
+numpy>=1.26
+rich>=13.7
+google-genai>=0.3        # only needed if LLM_BACKEND=gemini (the default)
+anthropic>=0.40          # optional: only needed if LLM_BACKEND=anthropic
+sentence-transformers>=2.7  # optional: real embeddings; falls back to a deterministic offline embedding if not installed
+# Note: the ccloud CLI (CockroachDB Cloud control plane) is a separate binary,
+# not a pip package -- see https://www.cockroachlabs.com/docs/cockroachcloud/ccloud-get-started
+# tools/ccloud_client.py no-ops gracefully if it isn't installed/configured.

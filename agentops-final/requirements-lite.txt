@@ -1,0 +1,11 @@
+# Same as requirements.txt but skips sentence-transformers (pulls in torch,
+# ~1-2GB and slow to install). tools/embeddings.py already has a deterministic
+# offline fallback, so the whole pipeline runs fine without it -- useful for a
+# quick, cheap EC2 instance for the hackathon demo deploy. See deploy/DEPLOY.md.
+psycopg2-binary>=2.9
+boto3>=1.34
+python-dotenv>=1.0
+numpy>=1.26
+rich>=13.7
+google-genai>=0.3
+anthropic>=0.40
