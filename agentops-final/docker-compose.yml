@@ -1,0 +1,15 @@
+# Local single-node CockroachDB for development only.
+# For the actual submission, use CockroachDB Cloud (free tier is fine, and
+# gives you the managed vector index feature without any ops work).
+version: "3.8"
+services:
+  crdb:
+    image: cockroachdb/cockroach:latest
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"   # SQL
+      - "8080:8080"     # DB Console
+    volumes:
+      - crdb-data:/cockroach/cockroach-data
+volumes:
+  crdb-data:
